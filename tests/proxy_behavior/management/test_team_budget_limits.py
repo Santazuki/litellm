@@ -288,34 +288,66 @@ async def test_check_user_team_limits(
 
 
 # ---------------------------------------------------------------------------
-# /team/update path — _check_user_team_limits on existing team, no-org.
-# Pin one over-budget rejection here so the update-side wiring is also
-# covered (the update path is a second call site with its own data shape).
+# /team/update path — a team admin may change the team budget but may NOT raise
+# it above the team's existing cap (only proxy admins can). The check compares
+# against the team's own cap, never the caller's personal max_budget.
 # ---------------------------------------------------------------------------
 
 
-async def test_team_update_user_limit_rejected(proxy_client, prisma, scratch):
+async def test_team_update_team_admin_budget_increase_above_existing_cap_blocked(
+    proxy_client, prisma, scratch
+):
     caller_cleartext = await _seed_scratch_actor_with_caps(
         prisma,
         scratch.prefix,
         max_budget=100.0,
     )
     creator_user_id = f"{scratch.prefix}-team-creator"
-    # Team must exist before /team/update; seed a standalone scratch team
-    # owned by the same actor so the update authz gate passes.
     team_id = await create_scratch_team(
         prisma,
         team_id=scratch.tag("team"),
         admin_user_ids=[creator_user_id],
         max_budget=50.0,
     )
+    # Raising above the team's existing $50 cap is rejected for a team admin.
     resp = await proxy_client.post(
         "/team/update",
         headers={"Authorization": f"Bearer {caller_cleartext}"},
         json={"team_id": team_id, "max_budget": 999.0},
     )
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 403, resp.text
+    # The team's own cap is referenced, not the caller's personal max_budget.
+    assert "max budget higher than user max" not in resp.text
 
     row = await prisma.db.litellm_teamtable.find_unique(where={"team_id": team_id})
     assert row is not None
-    assert row.max_budget == 50.0, "row max_budget mutated despite rejection"
+    assert row.max_budget == 50.0
+
+
+async def test_team_update_team_admin_budget_decrease_allowed(
+    proxy_client, prisma, scratch
+):
+    caller_cleartext = await _seed_scratch_actor_with_caps(
+        prisma,
+        scratch.prefix,
+        max_budget=100.0,
+    )
+    creator_user_id = f"{scratch.prefix}-team-creator"
+    team_id = await create_scratch_team(
+        prisma,
+        team_id=scratch.tag("team"),
+        admin_user_ids=[creator_user_id],
+        max_budget=500.0,
+    )
+    # Lowering the team budget is allowed even though the new value ($300) is
+    # still above the caller's personal max_budget ($100).
+    resp = await proxy_client.post(
+        "/team/update",
+        headers={"Authorization": f"Bearer {caller_cleartext}"},
+        json={"team_id": team_id, "max_budget": 300.0},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await prisma.db.litellm_teamtable.find_unique(where={"team_id": team_id})
+    assert row is not None
+    assert row.max_budget == 300.0
